@@ -1,0 +1,19 @@
+# Dependencies for the news, preprocessing, RAG and evaluation modules.
+pandas
+numpy
+torch
+transformers
+sentence-transformers
+faiss-cpu
+langchain-core
+langchain-community
+langchain-google-genai>=4.0.0
+python-dotenv
+ccxt
+gnews
+newspaper3k
+lxml_html_clean
+tqdm
+scikit-learn
+google-cloud-aiplatform
+matplotlib>=3.7.0

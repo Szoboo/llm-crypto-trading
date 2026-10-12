@@ -1,270 +1,706 @@
-import pandas as pd
+from __future__ import annotations
+
+
+
+from pathlib import Path
+
+
 
 import numpy as np
 
-import os
+import pandas as pd
 
-from sklearn.metrics import mean_squared_error, mean_absolute_error, f1_score, roc_auc_score
-
-
-
-def calculate_all_metrics(df):
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 
-    # -----------------------------
+# ============================================================
 
-    # 컬럼 체크
+# Professor feedback version: 1D price-tracking evaluation only
 
-    # -----------------------------
+# ============================================================
 
-    if "ret_strategy" not in df.columns:
+# - 4시간봉 방향성/수익률 중심 평가는 최종 출력에서 사용하지 않음
 
-        raise ValueError("ret_strategy 컬럼 없음")
+# - Buy & Hold 비교, 누적수익률, Sharpe, Win Rate 제거
+
+# - 2024-01-01 ~ 2025-04-30 구간만 평가
+
+# - 실제 ETH 시세 vs 예측 ETH 시세 그래프 생성
+
+# - 일별 squared error 그래프 생성
+
+# - MSE, MAE, RMSE, MAPE 중심 평가
+
+#
+
+# 주의:
+
+# 기존 LLM 결과는 직접적인 가격 회귀값이 아니라 up_prob/down_prob 기반 방향 예측값이다.
+
+# 따라서 이 파일은 4시간봉 LLM 확률을 1일 단위로 평균 집계하고,
+
+# 최근 7일 일간 변동성을 이용해 다음 날 예상 종가를 추정한다.
+
+# ============================================================
 
 
 
-    df = df.dropna(subset=["ret_strategy"]).copy()
+MASTER_FILE = "eth_master_data_filtered.csv"
 
-    if len(df) == 0:
-
-        return None
+RESULT_FILE = "eth_backtest_result_LLM_fulltext_2024_01_2025_04.csv"
 
 
 
-    # -----------------------------
+START_DATE = "2024-01-01"
 
-    # y_pred 생성 
+END_DATE = "2025-04-30"
 
-    # -----------------------------
 
-    if "up_prob" in df.columns:
 
-        df["y_pred"] = (df["up_prob"] > 0.5).astype(int)
+DAILY_OUTPUT_FILE = "eth_daily_price_tracking_2024_01_2025_04.csv"
+
+METRICS_OUTPUT_FILE = "eth_daily_price_tracking_metrics_2024_01_2025_04.csv"
+
+
+
+CHART_ACTUAL_VS_PREDICTED = "eth_daily_actual_vs_predicted_2024_01_2025_04.png"
+
+CHART_SQUARED_ERROR = "eth_daily_squared_error_2024_01_2025_04.png"
+
+CHART_ERROR_METRICS = "eth_daily_error_metrics_2024_01_2025_04.png"
+
+
+
+VOLATILITY_WINDOW = 7
+
+VOLATILITY_SCALE = 1.0
+
+MAX_EXPECTED_RETURN = 0.20
+
+
+
+
+
+def _require_file(path: str) -> None:
+
+    if not Path(path).exists():
+
+        raise FileNotFoundError(f"필수 파일을 찾을 수 없습니다: {path}")
+
+
+
+
+
+def _to_datetime_utc(series: pd.Series) -> pd.Series:
+
+    return pd.to_datetime(series, errors="coerce", utc=True)
+
+
+
+
+
+def _safe_float(series: pd.Series) -> pd.Series:
+
+    return pd.to_numeric(series, errors="coerce")
+
+
+
+
+
+def _pct(value: float | int | None, digits: int = 2) -> str:
+
+    if value is None or pd.isna(value):
+
+        return "nan"
+
+    return f"{float(value) * 100:.{digits}f}%"
+
+
+
+
+
+def _num(value: float | int | None, digits: int = 4) -> str:
+
+    if value is None or pd.isna(value):
+
+        return "nan"
+
+    return f"{float(value):.{digits}f}"
+
+
+
+
+
+def load_daily_dataset() -> pd.DataFrame:
+
+    _require_file(MASTER_FILE)
+
+    _require_file(RESULT_FILE)
+
+
+
+    master = pd.read_csv(MASTER_FILE)
+
+    result = pd.read_csv(RESULT_FILE)
+
+
+
+    for col in ["timestamp", "close"]:
+
+        if col not in master.columns:
+
+            raise ValueError(f"{MASTER_FILE}에 {col} 컬럼이 없습니다.")
+
+
+
+    for col in ["timestamp", "up_prob"]:
+
+        if col not in result.columns:
+
+            raise ValueError(f"{RESULT_FILE}에 {col} 컬럼이 없습니다.")
+
+
+
+    master = master.copy()
+
+    result = result.copy()
+
+
+
+    master["timestamp"] = _to_datetime_utc(master["timestamp"])
+
+    result["timestamp"] = _to_datetime_utc(result["timestamp"])
+
+
+
+    start = pd.Timestamp(START_DATE, tz="UTC")
+
+    end = pd.Timestamp(END_DATE, tz="UTC") + pd.Timedelta(days=1)
+
+
+
+    master = master[(master["timestamp"] >= start) & (master["timestamp"] < end)].copy()
+
+    result = result[(result["timestamp"] >= start) & (result["timestamp"] < end)].copy()
+
+
+
+    if len(master) == 0:
+
+        raise ValueError(f"{MASTER_FILE}에 평가 구간 데이터가 없습니다: {START_DATE} ~ {END_DATE}")
+
+
+
+    if len(result) == 0:
+
+        raise ValueError(
+
+            f"{RESULT_FILE}에 평가 구간 LLM 예측 결과가 없습니다: {START_DATE} ~ {END_DATE}\n"
+
+            "먼저 python .\\4_backtest_loop_last_eth.py 를 실행해 해당 기간의 결과 CSV를 생성하세요."
+
+        )
+
+
+
+    master["close"] = _safe_float(master["close"])
+
+    if "open" in master.columns:
+
+        master["open"] = _safe_float(master["open"])
+
+    if "high" in master.columns:
+
+        master["high"] = _safe_float(master["high"])
+
+    if "low" in master.columns:
+
+        master["low"] = _safe_float(master["low"])
+
+    if "volume" in master.columns:
+
+        master["volume"] = _safe_float(master["volume"])
+
+
+
+    result["up_prob"] = _safe_float(result["up_prob"])
+
+    if "down_prob" in result.columns:
+
+        result["down_prob"] = _safe_float(result["down_prob"])
 
     else:
 
-        df["y_pred"] = np.nan
+        result["down_prob"] = 1.0 - result["up_prob"]
 
 
 
-    returns = df["ret_strategy"].values
+    master = master.dropna(subset=["timestamp", "close"]).sort_values("timestamp")
 
+    result = result.dropna(subset=["timestamp", "up_prob", "down_prob"]).sort_values("timestamp")
 
 
-    # ======================
 
-    # 1. Regression Metrics
+    master["date"] = master["timestamp"].dt.floor("D")
 
-    # ======================
+    result["date"] = result["timestamp"].dt.floor("D")
 
-    if "y_true" in df.columns and "up_prob" in df.columns:
 
-        y_true = df["y_true"].values
 
-        y_prob = df["up_prob"].values
+    daily_agg = {"timestamp": "last", "close": "last"}
 
+    if "open" in master.columns:
 
+        daily_agg["open"] = "first"
 
-        mse = mean_squared_error(y_true, y_prob)
+    if "high" in master.columns:
 
-        rmse = np.sqrt(mse)
+        daily_agg["high"] = "max"
 
-        mae = mean_absolute_error(y_true, y_prob)
+    if "low" in master.columns:
 
+        daily_agg["low"] = "min"
 
+    if "volume" in master.columns:
 
-        mask = y_true != 0
+        daily_agg["volume"] = "sum"
 
-        mape = np.mean(np.abs((y_true[mask] - y_prob[mask]) / y_true[mask])) * 100 if np.sum(mask) > 0 else np.nan
 
-        
 
-        # (보조) AUC-ROC 추가
+    daily_price = (
 
-        try:
+        master.groupby("date", as_index=False)
 
-            auc_roc = roc_auc_score(y_true, y_prob)
+        .agg(daily_agg)
 
-        except ValueError:
+        .sort_values("date")
 
-            auc_roc = np.nan
+        .reset_index(drop=True)
 
-    else:
+    )
 
-        mse = rmse = mae = mape = auc_roc = np.nan
 
 
+    daily_price = daily_price.rename(columns={"close": "current_close"})
 
-    # ======================
+    daily_price["next_close"] = daily_price["current_close"].shift(-1)
 
-    # 2. Directional Accuracy & F1 Score
+    daily_price["target_date"] = daily_price["date"].shift(-1)
 
-    # ======================
+    daily_price["actual_daily_return"] = (
 
-    if "y_true" in df.columns and "y_pred" in df.columns:
+        daily_price["next_close"] / daily_price["current_close"] - 1.0
 
-        directional_acc = np.mean(df["y_true"] == df["y_pred"])
+    )
 
-        
 
-        # F1 Score 계산
 
-        f1 = f1_score(df["y_true"], df["y_pred"], zero_division=0)
+    daily_prob = (
 
+        result.groupby("date", as_index=False)
 
+        .agg(
 
-        if "pos_strategy" in df.columns:
+            up_prob_daily=("up_prob", "mean"),
 
-            non_flat = df[df["pos_strategy"] != 0]
+            down_prob_daily=("down_prob", "mean"),
 
-            directional_acc_nf = np.mean(non_flat["y_true"] == non_flat["y_pred"]) if len(non_flat) > 0 else np.nan
+            signal_count=("up_prob", "count"),
 
-        else:
+            last_prediction_timestamp=("timestamp", "last"),
 
-            directional_acc_nf = np.nan
+        )
 
-    else:
+        .sort_values("date")
 
-        directional_acc = directional_acc_nf = f1 = np.nan
+        .reset_index(drop=True)
 
+    )
 
 
-    # ======================
 
-    # 3. Trading Metrics
+    daily_prob["direction_signal"] = (
 
-    # ======================
+        daily_prob["up_prob_daily"] - daily_prob["down_prob_daily"]
 
+    )
 
 
-    cumulative_return = (1 + returns).prod() - 1
 
+    daily = pd.merge(daily_price, daily_prob, on="date", how="inner")
 
+    daily = daily.dropna(subset=["next_close", "actual_daily_return"]).copy()
 
-    n_candles_per_year = 6 * 365
+    daily = daily.sort_values("date").reset_index(drop=True)
 
-    mean_ret = np.mean(returns)
 
-    std_ret = np.std(returns)
 
+    if len(daily) == 0:
 
+        raise ValueError("가격 데이터와 LLM 예측 결과를 일 단위로 병합한 결과가 비어 있습니다.")
 
-    sharpe = (mean_ret / std_ret) * np.sqrt(n_candles_per_year) if std_ret != 0 else 0
 
 
+    daily["known_daily_return"] = daily["current_close"].pct_change()
 
-    cumulative_curve = (1 + returns).cumprod()
+    daily["daily_volatility_proxy"] = (
 
-    rolling_max = pd.Series(cumulative_curve).cummax()
+        daily["known_daily_return"]
 
-    drawdowns = (cumulative_curve - rolling_max) / rolling_max
+        .abs()
 
-    mdd = drawdowns.min()
+        .rolling(VOLATILITY_WINDOW, min_periods=3)
 
+        .mean()
 
+    )
 
-    trades = returns[returns != 0]
 
-    win_rate = np.mean(trades > 0) if len(trades) > 0 else 0
 
-    trade_ratio = len(trades) / len(df) if len(df) > 0 else 0
+    fallback_vol = daily["known_daily_return"].abs().median()
+
+    if pd.isna(fallback_vol) or fallback_vol == 0:
+
+        fallback_vol = 0.03
+
+
+
+    daily["daily_volatility_proxy"] = daily["daily_volatility_proxy"].fillna(fallback_vol)
+
+
+
+    daily["predicted_daily_return"] = (
+
+        daily["direction_signal"] * daily["daily_volatility_proxy"] * VOLATILITY_SCALE
+
+    ).clip(-MAX_EXPECTED_RETURN, MAX_EXPECTED_RETURN)
+
+
+
+    daily["predicted_next_close"] = daily["current_close"] * (
+
+        1.0 + daily["predicted_daily_return"]
+
+    )
+
+
+
+    daily["prediction_error"] = daily["predicted_next_close"] - daily["next_close"]
+
+    daily["abs_error"] = daily["prediction_error"].abs()
+
+    daily["squared_error"] = daily["prediction_error"] ** 2
+
+    daily["abs_pct_error"] = daily["abs_error"] / daily["next_close"].replace(0, np.nan)
+
+
+
+    daily["actual_direction"] = (daily["actual_daily_return"] > 0).astype(int)
+
+    daily["predicted_direction"] = (daily["predicted_daily_return"] > 0).astype(int)
+
+
+
+    daily["date_str"] = daily["date"].dt.strftime("%Y-%m-%d")
+
+    daily["target_date_str"] = daily["target_date"].dt.strftime("%Y-%m-%d")
+
+
+
+    return daily
+
+
+
+
+
+def calculate_daily_metrics(daily: pd.DataFrame) -> dict:
+
+    y_true_price = daily["next_close"].astype(float)
+
+    y_pred_price = daily["predicted_next_close"].astype(float)
+
+
+
+    mse = mean_squared_error(y_true_price, y_pred_price)
+
+    rmse = float(np.sqrt(mse))
+
+    mae = mean_absolute_error(y_true_price, y_pred_price)
+
+    mape = float(daily["abs_pct_error"].dropna().mean() * 100)
+
+
+
+    try:
+
+        corr = float(np.corrcoef(y_true_price, y_pred_price)[0, 1])
+
+    except Exception:
+
+        corr = np.nan
+
+
+
+    try:
+
+        r2 = float(r2_score(y_true_price, y_pred_price))
+
+    except Exception:
+
+        r2 = np.nan
+
+
+
+    daily_direction_accuracy = float(
+
+        (daily["actual_direction"] == daily["predicted_direction"]).mean()
+
+    )
+
+
+
+    mean_actual_close = float(y_true_price.mean())
+
+    mae_pct_of_price = float(mae / mean_actual_close * 100) if mean_actual_close else np.nan
+
+    rmse_pct_of_price = float(rmse / mean_actual_close * 100) if mean_actual_close else np.nan
 
 
 
     return {
 
-        "mse": mse, "rmse": rmse, "mae": mae, "mape": mape,
+        "evaluation_unit": "1D",
 
-        "auc_roc": auc_roc,
+        "period": f"{START_DATE} ~ {END_DATE}",
 
-        "directional_acc": directional_acc,
+        "sample_days": int(len(daily)),
 
-        "directional_acc_nf": directional_acc_nf,
+        "mse": float(mse),
 
-        "f1_score": f1,
+        "rmse": float(rmse),
 
-        "win_rate": win_rate,
+        "mae": float(mae),
 
-        "cumulative_return": cumulative_return,
+        "mape_pct": float(mape),
 
-        "sharpe": sharpe,
+        "mae_pct_of_avg_price": mae_pct_of_price,
 
-        "mdd": mdd,
+        "rmse_pct_of_avg_price": rmse_pct_of_price,
 
-        "trade_ratio": trade_ratio,
+        "actual_predicted_corr": corr,
 
-        "total_points": len(df),
+        "r2_score": r2,
 
-        "successful_preds": int(np.sum(df["y_true"] == df["y_pred"])) if "y_true" in df.columns else 0
+        "daily_direction_accuracy": daily_direction_accuracy,
+
+        "mean_actual_close": mean_actual_close,
+
+        "mean_predicted_close": float(y_pred_price.mean()),
+
+        "mean_abs_daily_return": float(daily["actual_daily_return"].abs().mean()),
 
     }
 
 
 
-def print_metrics(metrics):
+
+
+def print_metrics(metrics: dict) -> None:
+
+    print()
+
+    print("=" * 78)
+
+    print(" DAILY ETH PRICE-TRACKING EVALUATION")
+
+    print("=" * 78)
+
+    print()
+
+    print("[DATASET]")
+
+    print(f"Evaluation Unit : {metrics['evaluation_unit']}")
+
+    print(f"Period          : {metrics['period']}")
+
+    print(f"Sample Days     : {metrics['sample_days']}")
+
+    print()
+
+    print("[PRICE ERROR METRICS]")
+
+    print(f"MSE             : {_num(metrics['mse'], 4)}")
+
+    print(f"RMSE            : {_num(metrics['rmse'], 4)}")
+
+    print(f"MAE             : {_num(metrics['mae'], 4)}")
+
+    print(f"MAPE            : {metrics['mape_pct']:.2f}%")
+
+    print(f"MAE / Avg Price : {metrics['mae_pct_of_avg_price']:.2f}%")
+
+    print(f"RMSE / Avg Price: {metrics['rmse_pct_of_avg_price']:.2f}%")
+
+    print()
+
+    print("[PRICE TREND FOLLOWING CHECK]")
+
+    print(f"Actual-Predicted Correlation : {_num(metrics['actual_predicted_corr'], 4)}")
+
+    print(f"R2 Score                     : {_num(metrics['r2_score'], 4)}")
+
+    print(f"Daily Direction Accuracy     : {_pct(metrics['daily_direction_accuracy'])}")
+
+    print()
+
+    print("[NOTE]")
+
+    print("Buy & Hold 비교, 누적수익률, Sharpe, Win Rate는 교수님 피드백에 따라 최종 출력에서 제외했습니다.")
+
+    print("최종 평가는 2024-01-01 ~ 2025-04-30 구간의 1일 단위 ETH 가격 추종 성능입니다.")
+
+    print()
 
 
 
-    if metrics is None:
-
-        print("계산할 데이터가 없습니다.")
-
-        return
 
 
+def make_charts(daily: pd.DataFrame, metrics: dict) -> None:
 
-    print("--- [Regression Metrics] ---")
+    try:
 
-    print(f"MSE: {metrics['mse']:.6f}")
+        import matplotlib.pyplot as plt
 
-    print(f"RMSE: {metrics['rmse']:.6f}")
+    except ImportError as exc:
 
-    print(f"MAE: {metrics['mae']:.6f}")
+        raise ImportError(
 
-    if not np.isnan(metrics['mape']):
+            "그래프 생성을 위해 matplotlib이 필요합니다. pip install matplotlib 실행 후 다시 시도하세요."
 
-        print(f"MAPE: {metrics['mape']:.2f}%")
-
-    if not np.isnan(metrics['auc_roc']):
-
-        print(f"(보조) AUC-ROC: {metrics['auc_roc']:.4f}")
-
-    else:
-
-        print("(보조) AUC-ROC: nan")
+        ) from exc
 
 
 
-    print("\n--- [Directional Accuracy] ---")
-
-    print(f"Total Accuracy: {metrics['directional_acc']*100:.2f}%")
-
-    print(f"Non-Flat Accuracy: {metrics['directional_acc_nf']*100:.2f}%")
-
-    print(f"F1 Score: {metrics['f1_score']:.4f}")
+    x = pd.to_datetime(daily["target_date"])
 
 
 
-    print("\n--- [Trading Performance (Annualized)] ---")
+    plt.figure(figsize=(12, 6))
 
-    print(f"Cumulative Return: {metrics['cumulative_return']*100:.2f}%")
+    plt.plot(x, daily["next_close"], marker="o", linewidth=2, label="Actual ETH close")
 
-    print(f"Win Rate: {metrics['win_rate']*100:.2f}%")
+    plt.plot(x, daily["predicted_next_close"], marker="o", linewidth=2, label="Predicted ETH close")
 
-    print(f"Annualized Sharpe Ratio: {metrics['sharpe']:.4f}")
+    plt.title("Daily ETH Actual vs Predicted Close")
 
-    print(f"Max Drawdown (MDD): {metrics['mdd']*100:.2f}%")
+    plt.xlabel("Date")
 
-    print(f"Trade Ratio: {metrics['trade_ratio']*100:.2f}%")
+    plt.ylabel("ETH price")
+
+    plt.legend()
+
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    plt.savefig(CHART_ACTUAL_VS_PREDICTED, dpi=220, bbox_inches="tight")
+
+    plt.close()
 
 
 
-    print("\n--- [Summary] ---")
+    plt.figure(figsize=(12, 5))
 
-    print(f"Total Candles: {metrics['total_points']}")
+    plt.bar(x, daily["squared_error"])
 
-    print(f"Correct Predictions: {metrics['successful_preds']}")
+    plt.title(f"Daily Squared Error  |  MSE = {metrics['mse']:.2f}")
+
+    plt.xlabel("Date")
+
+    plt.ylabel("(Predicted close - Actual close)^2")
+
+    plt.grid(True, axis="y", alpha=0.3)
+
+    plt.tight_layout()
+
+    plt.savefig(CHART_SQUARED_ERROR, dpi=220, bbox_inches="tight")
+
+    plt.close()
+
+
+
+    metric_names = ["MSE", "MAE", "RMSE", "MAPE (%)"]
+
+    metric_values = [
+
+        metrics["mse"],
+
+        metrics["mae"],
+
+        metrics["rmse"],
+
+        metrics["mape_pct"],
+
+    ]
+
+
+
+    plt.figure(figsize=(9, 5))
+
+    plt.bar(metric_names, metric_values)
+
+    plt.title("Daily Price Tracking Error Metrics")
+
+    plt.ylabel("Value")
+
+    for i, v in enumerate(metric_values):
+
+        plt.text(i, v, f"{v:.2f}", ha="center", va="bottom")
+
+    plt.tight_layout()
+
+    plt.savefig(CHART_ERROR_METRICS, dpi=220, bbox_inches="tight")
+
+    plt.close()
+
+
+
+
+
+def main() -> None:
+
+    daily = load_daily_dataset()
+
+    metrics = calculate_daily_metrics(daily)
+
+
+
+    daily.to_csv(DAILY_OUTPUT_FILE, index=False, encoding="utf-8-sig")
+
+    pd.DataFrame([metrics]).to_csv(METRICS_OUTPUT_FILE, index=False, encoding="utf-8-sig")
+
+
+
+    make_charts(daily, metrics)
+
+    print_metrics(metrics)
+
+
+
+    print("[OUTPUT FILES]")
+
+    print(f"Daily prediction data : {DAILY_OUTPUT_FILE}")
+
+    print(f"Daily metrics summary : {METRICS_OUTPUT_FILE}")
+
+    print(f"Actual vs predicted   : {CHART_ACTUAL_VS_PREDICTED}")
+
+    print(f"Squared error chart   : {CHART_SQUARED_ERROR}")
+
+    print(f"Error metrics chart   : {CHART_ERROR_METRICS}")
+
+    print()
 
 
 
@@ -272,20 +708,5 @@ def print_metrics(metrics):
 
 if __name__ == "__main__":
 
+    main()
 
-
-    RESULT_FILE = "eth_backtest_result_LLM_fixed.csv"
-
-
-
-    if os.path.exists(RESULT_FILE):
-
-        df = pd.read_csv(RESULT_FILE)
-
-        metrics = calculate_all_metrics(df)
-
-        print_metrics(metrics)
-
-    else:
-
-        print(f"파일을 찾을 수 없습니다: {RESULT_FILE}")

@@ -3,12 +3,15 @@
 !.env.example
 __pycache__/
 *.py[cod]
+.pytest_cache/
 .venv/
 venv/
 .vscode/
 hf_cache_dir/
+patch_backups/
 *.csv
 *.log
+auto_trading_state*.json
 gemini_prediction.txt
 gemini_strategy.txt
 *.pem

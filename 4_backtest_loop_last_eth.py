@@ -1,12 +1,16 @@
-import pandas as pd
-
 import os
-
-import time
 
 import re
 
+import time
+
+from pathlib import Path
+
+
+
 import numpy as np
+
+import pandas as pd
 
 from tqdm import tqdm
 
@@ -18,15 +22,39 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 from langchain_core.prompts import PromptTemplate
 
-from google.cloud import aiplatform
-
 
 
 # 설정값
 
-MASTER_DATA_FILE = "eth_master_data_filtered.csv"
+# 설정값
 
-BACKTEST_RESULT_FILE = "eth_backtest_result_LLM_fixed.csv"
+BASE_DIR = Path(__file__).resolve().parent
+
+
+
+load_dotenv(BASE_DIR / ".env")
+
+load_dotenv()
+
+
+
+MASTER_DATA_FILE = BASE_DIR / "eth_master_data_filtered.csv"
+
+
+
+# 기존 실패 결과 파일과 섞이지 않도록 새 파일 사용
+
+START_DATE = "2024-01-01"
+
+END_DATE = "2025-04-30"
+
+
+
+BACKTEST_RESULT_FILE = BASE_DIR / "eth_backtest_result_LLM_fulltext_2024_01_2025_04.csv"
+
+
+
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 
@@ -52,7 +80,11 @@ SAVE_INTERVAL = 5
 
 PROMPT_TEMPLATE = """
 
-Predict ETH direction for NEXT 4h candle.
+You are a strict ETH direction classifier.
+
+
+
+Predict ETH direction for the NEXT 4h candle using only the data below.
 
 
 
@@ -70,7 +102,17 @@ Sentiment: {sentiment}
 
 
 
-Output EXACTLY:
+STRICT OUTPUT RULES:
+
+- Do not write analysis.
+
+- Do not use markdown.
+
+- Do not add explanations.
+
+- Output exactly three lines.
+
+- Probabilities must be decimals between 0 and 1.
 
 
 
@@ -94,29 +136,209 @@ Prompt = PromptTemplate(
 
 
 
+def load_vertex_config():
+
+    """
+
+    Vertex AI 방식:
+
+    - Gemini Developer API key 사용 안 함
+
+    - GCP_PROJECT_ID / GCP_LOCATION 사용
+
+    - 인증은 gcloud ADC 사용
+
+    """
+
+    project_id = os.getenv("GCP_PROJECT_ID")
+
+    location = os.getenv("GCP_LOCATION", "us-central1")
+
+
+
+    if not project_id:
+
+        raise RuntimeError(
+
+            "GCP_PROJECT_ID가 없습니다. .env에 GCP_PROJECT_ID를 설정하세요."
+
+        )
+
+
+
+    # langchain-google-genai가 Vertex backend를 쓰도록 명시
+
+    os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
+
+    os.environ["GOOGLE_CLOUD_LOCATION"] = location
+
+
+
+    return project_id, location
+
+
+
 def parse_probs(text):
 
-    try:
+    """
 
-        up = re.search(r"UP_probability[: ]*([0-9]*\.?[0-9]+)", text)
+    Gemini 응답에서 UP/DOWN 확률을 최대한 안정적으로 추출한다.
 
-        down = re.search(r"DOWN_probability[: ]*([0-9]*\.?[0-9]+)", text)
 
-        if up and down:
 
-            up_val = float(up.group(1))
+    1순위: UP_probability / DOWN_probability 정규식 파싱
 
-            down_val = float(down.group(1))
+    2순위: JSON-like 응답에서 up_probability / down_probability 파싱
 
-            if up_val > 1: up_val /= 100
+    3순위: Decision만 있을 경우 보수적 확률로 fallback
 
-            if down_val > 1: down_val /= 100
+    4순위: 분석형 장문 응답일 경우 bullish/bearish 키워드 기반 fallback
 
-            return up_val, down_val, True
 
-    except:
 
-        pass
+    반환:
+
+        up, down, parse_success
+
+
+
+    parse_success=False인 경우는 원본 포맷은 깨졌지만 fallback으로 진행했다는 뜻이다.
+
+    백테스트를 중단하지 않고 결과 CSV에 parse_success=0으로 기록한다.
+
+    """
+
+    text = str(text or "")
+
+    normalized = text.replace("\n", " ")
+
+
+
+    patterns = [
+
+        (r"UP_probability\s*[:=]\s*([0-9]*\.?[0-9]+)", r"DOWN_probability\s*[:=]\s*([0-9]*\.?[0-9]+)"),
+
+        (r"up_probability\s*['\"]?\s*[:=]\s*([0-9]*\.?[0-9]+)", r"down_probability\s*['\"]?\s*[:=]\s*([0-9]*\.?[0-9]+)"),
+
+        (r"UP\s*probability\s*[:=]\s*([0-9]*\.?[0-9]+)", r"DOWN\s*probability\s*[:=]\s*([0-9]*\.?[0-9]+)"),
+
+        (r"UP\s*[:=]\s*([0-9]*\.?[0-9]+)", r"DOWN\s*[:=]\s*([0-9]*\.?[0-9]+)"),
+
+    ]
+
+
+
+    for up_pat, down_pat in patterns:
+
+        try:
+
+            up_match = re.search(up_pat, normalized, flags=re.IGNORECASE)
+
+            down_match = re.search(down_pat, normalized, flags=re.IGNORECASE)
+
+            if up_match and down_match:
+
+                up_val = float(up_match.group(1))
+
+                down_val = float(down_match.group(1))
+
+
+
+                if up_val > 1:
+
+                    up_val /= 100
+
+                if down_val > 1:
+
+                    down_val /= 100
+
+
+
+                up_val = max(0.0, min(1.0, up_val))
+
+                down_val = max(0.0, min(1.0, down_val))
+
+
+
+                total = up_val + down_val
+
+                if total > 0:
+
+                    up_val /= total
+
+                    down_val /= total
+
+
+
+                return up_val, down_val, True
+
+        except Exception:
+
+            pass
+
+
+
+    # Decision만 있는 경우 fallback
+
+    decision_match = re.search(r"Decision\s*[:=]\s*(UP|DOWN|NEUTRAL)", normalized, flags=re.IGNORECASE)
+
+    if decision_match:
+
+        decision = decision_match.group(1).upper()
+
+        if decision == "UP":
+
+            return 0.60, 0.40, False
+
+        if decision == "DOWN":
+
+            return 0.40, 0.60, False
+
+        return 0.50, 0.50, False
+
+
+
+    # 장문 분석 응답 fallback: bearish/bullish 키워드 기반
+
+    lower = normalized.lower()
+
+
+
+    bullish_words = [
+
+        "bullish", "uptrend", "upward", "rebound", "breakout",
+
+        "positive momentum", "strong momentum", "rising", "increase"
+
+    ]
+
+    bearish_words = [
+
+        "bearish", "downtrend", "downward", "depreciation", "correction",
+
+        "pullback", "overbought", "declining", "decrease", "weakness"
+
+    ]
+
+
+
+    bullish_score = sum(1 for word in bullish_words if word in lower)
+
+    bearish_score = sum(1 for word in bearish_words if word in lower)
+
+
+
+    if bullish_score > bearish_score:
+
+        return 0.55, 0.45, False
+
+    if bearish_score > bullish_score:
+
+        return 0.45, 0.55, False
+
+
 
     return 0.5, 0.5, False
 
@@ -210,9 +432,13 @@ def strategy_llm(up, down, df, sentiment,
 
 def run_backtest():
 
-    load_dotenv()
+    project_id, location = load_vertex_config()
 
-    aiplatform.init(project=os.getenv("GCP_PROJECT_ID"), location=os.getenv("GCP_LOCATION", "asia-northeast3"))
+
+
+    if not MASTER_DATA_FILE.exists():
+
+        raise FileNotFoundError(f"master dataset을 찾을 수 없습니다: {MASTER_DATA_FILE}")
 
 
 
@@ -220,21 +446,63 @@ def run_backtest():
 
     df.sort_index(inplace=True)
 
-    
-
-    # 최근 30일 데이터 필터링
-
-    cutoff_date = df.index.max() - pd.Timedelta(days=30)
-
-    df = df[df.index >= cutoff_date]
 
 
+    # 지정 기간 데이터 필터링: 2024-01-01 ~ 2025-04-30
+
+    if df.index.tz is None:
+
+        df.index = df.index.tz_localize("UTC")
+
+    else:
+
+        df.index = df.index.tz_convert("UTC")
+
+
+
+    start = pd.Timestamp(START_DATE, tz="UTC")
+
+    end = pd.Timestamp(END_DATE, tz="UTC") + pd.Timedelta(days=1)
+
+
+
+    df = df[(df.index >= start) & (df.index < end)].copy()
+
+
+
+    if len(df) <= LOOKBACK + 1:
+
+        raise ValueError(
+
+            f"백테스트 구간 데이터가 부족합니다: {START_DATE} ~ {END_DATE}, rows={len(df)}"
+
+        )
+
+
+
+    print(f"[INFO] Backtest period: {START_DATE} ~ {END_DATE}")
 
     print(f"[INFO] Rows to test: {len(df)}")
 
+    print(f"[INFO] Result file: {BACKTEST_RESULT_FILE.name}")
 
 
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
+
+    llm = ChatGoogleGenerativeAI(
+
+    model=MODEL_NAME,
+
+    project=project_id,
+
+    location=location,
+
+    vertexai=True,
+
+    temperature=0.1
+
+)
+
+
 
     chain = Prompt | llm
 
@@ -322,15 +590,35 @@ def run_backtest():
 
 
 
+        response_text = ""
+
+        up, down, parse_success = 0.5, 0.5, False
+
+
+
         try:
 
             res = chain.invoke(prompt_input)
 
-            up, down, parse_success = parse_probs(res.content)
+            response_text = getattr(res, "content", str(res))
 
-        except:
+            up, down, parse_success = parse_probs(response_text)
 
-            up, down, parse_success = 0.5, 0.5, False
+
+
+            if not parse_success:
+
+                print("\n[PARSE WARNING] Gemini 응답이 지정 포맷과 달라 fallback 확률을 사용합니다.")
+
+                print(response_text[:700])
+
+
+
+        except Exception as e:
+
+            print(f"\n[LLM ERROR] {type(e).__name__}: {e}")
+
+            raise
 
 
 
@@ -390,7 +678,11 @@ def run_backtest():
 
             "up_prob": up,
 
+            "down_prob": down,
+
             "y_true": 1 if actual_return > 0 else 0,
+
+            "actual_return": actual_return,
 
             # 포지션 정보
 
@@ -417,6 +709,8 @@ def run_backtest():
             "parse_success": 1 if parse_success else 0
 
         })
+
+        prev_pos_strategy = pos_strategy
 
 
 

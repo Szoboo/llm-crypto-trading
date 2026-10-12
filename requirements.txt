@@ -1,19 +1,2 @@
-# Inferred from imports; original environment versions were not provided.
-# End-to-end compatibility has not been verified.
-pandas
-numpy
-torch
-transformers
-sentence-transformers
-faiss-cpu
-langchain-core
-langchain-community
-langchain-google-genai
-python-dotenv
-ccxt
-gnews
-newspaper3k
-lxml_html_clean
-tqdm
-scikit-learn
-google-cloud-aiplatform
+matplotlib>=3.7.0
+
