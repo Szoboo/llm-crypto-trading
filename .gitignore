@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+hf_cache_dir/
+*.csv
+*.log
+gemini_prediction.txt
+gemini_strategy.txt
+*.pem
+*.key
+credentials*.json
+service_account*.json
